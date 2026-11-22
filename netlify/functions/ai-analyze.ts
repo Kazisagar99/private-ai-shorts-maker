@@ -9,59 +9,6 @@ interface AnalyzeRequest {
   language: 'bn' | 'en' | 'both';
 }
 
-interface ModelItem {
-  name?: string;
-  supportedGenerationMethods?: string[];
-}
-
-async function callGemini(apiKey: string, model: string, prompt: string) {
-  const cleanModel = model.replace(/^models\//, '');
-  return fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${cleanModel}:generateContent`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': apiKey,
-      },
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        generationConfig: {
-          responseMimeType: 'application/json',
-          temperature: 0.6,
-        },
-      }),
-    }
-  );
-}
-
-async function detectActiveModel(apiKey: string): Promise<{ model: string | null; listError?: string }> {
-  const res = await fetch('https://generativelanguage.googleapis.com/v1beta/models', {
-    headers: { 'x-goog-api-key': apiKey },
-  });
-  if (!res.ok) {
-    const txt = await res.text();
-    return { model: null, listError: `Model list (${res.status}): ${txt.slice(0, 220)}` };
-  }
-  const data = (await res.json()) as { models?: ModelItem[] };
-  const skip = ['embedding', 'aqa', 'imagen', 'veo', 'tts', 'audio', 'image', 'robotics', 'computer-use'];
-  const valid = (data.models || []).filter((m) => {
-    const n = (m.name || '').toLowerCase();
-    return (
-      n.includes('gemini') &&
-      m.supportedGenerationMethods?.includes('generateContent') &&
-      !skip.some((word) => n.includes(word))
-    );
-  });
-
-  const preferred =
-    valid.find((m) => m.name!.includes('flash') && !m.name!.includes('lite') && !m.name!.includes('exp')) ||
-    valid.find((m) => m.name!.includes('flash')) ||
-    valid[0];
-
-  return { model: preferred?.name?.replace(/^models\//, '') || null };
-}
-
 export const handler: Handler = async (event) => {
   if (event.httpMethod !== 'POST') return json(405, { error: 'Method not allowed' });
   if (!verifySession(event)) return json(401, { error: 'Unauthorized' });
@@ -85,6 +32,7 @@ export const handler: Handler = async (event) => {
     return json(400, { error: 'Please provide a transcript of at least 20 characters.' });
   }
 
+  const model = (process.env.GEMINI_MODEL || 'gemini-3.8-flash').trim().replace(/^models\//, '');
   const prompt = `
 You are an expert short-form video editor and viral content strategist for YouTube Shorts, Instagram Reels, and Facebook Reels.
 Analyze the following transcript for the video "${body.videoTitle || 'Untitled'}".
@@ -124,18 +72,21 @@ ${body.transcript.slice(0, 24000)}
 `.trim();
 
   try {
-    let model = (process.env.GEMINI_MODEL || 'gemini-2.5-flash').trim();
-    let response = await callGemini(apiKey, model, prompt);
-
-    if (response.status === 404) {
-      const { model: detected, listError } = await detectActiveModel(apiKey);
-      if (detected) {
-        model = detected;
-        response = await callGemini(apiKey, model, prompt);
-      } else if (listError) {
-        return json(502, { error: listError });
-      }
-    }
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': apiKey,
+      },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig: {
+          responseMimeType: 'application/json',
+          temperature: 0.6,
+        },
+      }),
+    });
 
     if (!response.ok) {
       const errText = await response.text();
@@ -144,7 +95,7 @@ ${body.transcript.slice(0, 24000)}
         const parsedErr = JSON.parse(errText) as { error?: { message?: string } };
         if (parsedErr.error?.message) reason = parsedErr.error.message;
       } catch {
-        // keep snippet
+        // keep raw snippet
       }
       return json(response.status, {
         error: `Gemini API (${response.status}, ${model}): ${reason}`,
