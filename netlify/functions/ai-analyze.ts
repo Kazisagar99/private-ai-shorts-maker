@@ -13,7 +13,7 @@ async function callGemini(
   apiKey: string,
   model: string,
   prompt: string,
-  disableThinking: boolean,
+  thinkingConfig: Record<string, unknown> | null,
   timeoutMs: number
 ) {
   const cleanModel = model.replace(/^models\//, '');
@@ -22,11 +22,11 @@ async function callGemini(
 
   const generationConfig: Record<string, unknown> = {
     responseMimeType: 'application/json',
-    temperature: 0.5,
-    maxOutputTokens: 2048,
+    temperature: 0.4,
+    maxOutputTokens: 1200,
   };
-  if (disableThinking) {
-    generationConfig.thinkingConfig = { thinkingBudget: 0 };
+  if (thinkingConfig) {
+    generationConfig.thinkingConfig = thinkingConfig;
   }
 
   try {
@@ -77,28 +77,44 @@ export const handler: Handler = async (event) => {
     .trim()
     .replace(/^models\//, '');
 
-  const prompt = `Analyze this transcript for "${body.videoTitle || 'Video'}" (~${body.clipDuration || 30}s Shorts, language: ${body.language || 'both'}).
-Timestamps present: ${body.hasTimestamps ? 'YES' : 'NO'}.
-Rules: Return ONLY compact valid JSON. Keep every item short and punchy. If Timestamps=NO, set startSec and endSec to null.
-Exact counts: 2 clipIdeas, 3 viralHooks, 3 titles, 2 descriptions, 5 hashtags, 3 thumbnailTexts, 3 bengaliCaptions, 3 englishCaptions.
-Schema:
+  const prompt = `Analyze transcript for "${body.videoTitle || 'Video'}" (~${body.clipDuration || 30}s Shorts, lang: ${body.language || 'both'}).
+Timestamps: ${body.hasTimestamps ? 'YES' : 'NO'}.
+Return ONLY valid JSON. Short punchy lines. If Timestamps=NO, startSec & endSec must be null.
+Counts: 2 clipIdeas, 3 viralHooks, 3 titles, 2 descriptions, 5 hashtags, 3 thumbnailTexts, 3 bengaliCaptions, 3 englishCaptions.
+Format:
 {"clipIdeas":[{"title":"","hook":"","reason":"","startSec":null,"endSec":null,"platformFit":["YouTube Shorts","Instagram Reels"]}],"viralHooks":[""],"titles":[""],"descriptions":[""],"hashtags":["#tag"],"thumbnailTexts":[""],"bengaliCaptions":[""],"englishCaptions":[""]}
 
 Transcript:
-${body.transcript.slice(0, 12000)}`;
+${body.transcript.slice(0, 8000)}`;
 
   const startedAt = Date.now();
+  let stage = 'MINIMAL';
+  let fallbackReason = '';
 
   try {
-    let response = await callGemini(apiKey, model, prompt, true, 8500);
+    let response = await callGemini(apiKey, model, prompt, { thinkingLevel: 'MINIMAL' }, 9000);
 
     if (response.status === 400) {
-      const firstErr = await response.text();
-      if (firstErr.toLowerCase().includes('thinking')) {
-        const remaining = Math.max(3000, 9000 - (Date.now() - startedAt));
-        response = await callGemini(apiKey, model, prompt, false, remaining);
+      const err1 = await response.text();
+      if (err1.toLowerCase().includes('thinking') || err1.toLowerCase().includes('level')) {
+        fallbackReason = err1.slice(0, 100);
+        stage = 'LOW';
+        const rem1 = Math.max(2500, 9200 - (Date.now() - startedAt));
+        response = await callGemini(apiKey, model, prompt, { thinkingLevel: 'LOW' }, rem1);
       } else {
-        return json(400, { error: `Gemini (400, ${model}): ${firstErr.slice(0, 220)}` });
+        return json(400, { error: `Gemini (400, ${model}): ${err1.slice(0, 220)}` });
+      }
+    }
+
+    if (response.status === 400) {
+      const err2 = await response.text();
+      if (err2.toLowerCase().includes('thinking') || err2.toLowerCase().includes('level')) {
+        fallbackReason = err2.slice(0, 100);
+        stage = 'DEFAULT';
+        const rem2 = Math.max(2000, 9300 - (Date.now() - startedAt));
+        response = await callGemini(apiKey, model, prompt, null, rem2);
+      } else {
+        return json(400, { error: `Gemini (400, ${model}): ${err2.slice(0, 220)}` });
       }
     }
 
@@ -112,7 +128,7 @@ ${body.transcript.slice(0, 12000)}`;
         // keep snippet
       }
       return json(response.status, {
-        error: `Gemini (${response.status}, ${model}): ${reason}`,
+        error: `Gemini (${response.status}, ${model}, ${stage}): ${reason}`,
       });
     }
 
@@ -128,8 +144,9 @@ ${body.transcript.slice(0, 12000)}`;
   } catch (err) {
     const elapsed = Date.now() - startedAt;
     if (err instanceof Error && err.name === 'AbortError') {
+      const note = fallbackReason ? ` | prev: ${fallbackReason}` : '';
       return json(504, {
-        error: `Gemini (${model}) took >${Math.round(elapsed / 1000)}s. Retry once or try a shorter transcript.`,
+        error: `Gemini (${model}, ${stage}) took >${Math.round(elapsed / 1000)}s${note}`,
       });
     }
     return json(500, {
