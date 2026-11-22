@@ -13,3 +13,4 @@ Mobile-first personal AI Shorts & Reels Studio with Dark Liquid Glass UI, Bengal
    - `GEMINI_MODEL`: `gemini-2.5-flash`
 4. Trigger a deploy and open your `.netlify.app` URL in Chrome on Android.
 5. Tap Chrome Menu (⋮) → **Add to Home screen → Install** to use as an Android PWA app.
+  
