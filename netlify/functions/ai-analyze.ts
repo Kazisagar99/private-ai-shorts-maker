@@ -9,11 +9,81 @@ interface AnalyzeRequest {
   language: 'bn' | 'en' | 'both';
 }
 
+interface ModelItem {
+  name?: string;
+  supportedGenerationMethods?: string[];
+}
+
+function buildPayload(prompt: string) {
+  return JSON.stringify({
+    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+    generationConfig: {
+      responseMimeType: 'application/json',
+      temperature: 0.6,
+    },
+  });
+}
+
+async function callGeminiStudio(apiKey: string, model: string, prompt: string) {
+  const cleanModel = model.replace(/^models\//, '');
+  return fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${cleanModel}:generateContent`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': apiKey,
+      },
+      body: buildPayload(prompt),
+    }
+  );
+}
+
+async function callVertexExpress(apiKey: string, model: string, prompt: string) {
+  const cleanModel = model.replace(/^models\//, '');
+  return fetch(
+    `https://aiplatform.googleapis.com/v1/publishers/google/models/${cleanModel}:generateContent?key=${encodeURIComponent(apiKey)}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: buildPayload(prompt),
+    }
+  );
+}
+
+async function findWorkingFlashModel(apiKey: string): Promise<string | null> {
+  try {
+    const res = await fetch('https://generativelanguage.googleapis.com/v1beta/models', {
+      headers: { 'x-goog-api-key': apiKey },
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { models?: ModelItem[] };
+    const valid = (data.models || []).filter(
+      (m) =>
+        m.name &&
+        m.supportedGenerationMethods?.includes('generateContent') &&
+        m.name.toLowerCase().includes('gemini')
+    );
+    const preferred =
+      valid.find(
+        (m) =>
+          m.name!.includes('flash') &&
+          !m.name!.includes('preview') &&
+          !m.name!.includes('exp')
+      ) ||
+      valid.find((m) => m.name!.includes('flash')) ||
+      valid[0];
+    return preferred?.name?.replace(/^models\//, '') || null;
+  } catch {
+    return null;
+  }
+}
+
 export const handler: Handler = async (event) => {
   if (event.httpMethod !== 'POST') return json(405, { error: 'Method not allowed' });
   if (!verifySession(event)) return json(401, { error: 'Unauthorized' });
 
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = process.env.GEMINI_API_KEY?.trim();
   if (!apiKey) {
     return json(503, {
       code: 'AI_NOT_CONFIGURED',
@@ -32,7 +102,6 @@ export const handler: Handler = async (event) => {
     return json(400, { error: 'Please provide a transcript of at least 20 characters.' });
   }
 
-  const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
   const prompt = `
 You are an expert short-form video editor and viral content strategist for YouTube Shorts, Instagram Reels, and Facebook Reels.
 Analyze the following transcript for the video "${body.videoTitle || 'Untitled'}".
@@ -72,24 +141,32 @@ ${body.transcript.slice(0, 24000)}
 `.trim();
 
   try {
-    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        generationConfig: {
-          responseMimeType: 'application/json',
-          temperature: 0.6,
-        },
-      }),
-    });
+    let model = (process.env.GEMINI_MODEL || 'gemini-2.5-flash').trim();
+    let response = apiKey.startsWith('AQ.')
+      ? await callVertexExpress(apiKey, model, prompt)
+      : await callGeminiStudio(apiKey, model, prompt);
+
+    if (response.status === 404) {
+      const detected = await findWorkingFlashModel(apiKey);
+      if (detected) {
+        model = detected;
+        response = await callGeminiStudio(apiKey, model, prompt);
+      } else if (!apiKey.startsWith('AQ.')) {
+        response = await callVertexExpress(apiKey, model, prompt);
+      }
+    }
 
     if (!response.ok) {
       const errText = await response.text();
+      let reason = errText.slice(0, 260);
+      try {
+        const parsedErr = JSON.parse(errText) as { error?: { message?: string } };
+        if (parsedErr.error?.message) reason = parsedErr.error.message;
+      } catch {
+        // keep snippet
+      }
       return json(response.status, {
-        error: `Gemini API returned ${response.status}`,
-        details: errText.slice(0, 400),
+        error: `Gemini API (${response.status}, ${model}): ${reason}`,
       });
     }
 
@@ -99,7 +176,8 @@ ${body.transcript.slice(0, 24000)}
     const rawText = result.candidates?.[0]?.content?.parts?.[0]?.text;
     if (!rawText) return json(502, { error: 'Empty response from Gemini API.' });
 
-    const parsed = JSON.parse(rawText);
+    const cleaned = rawText.replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim();
+    const parsed = JSON.parse(cleaned);
     return json(200, parsed);
   } catch (err) {
     return json(500, {
