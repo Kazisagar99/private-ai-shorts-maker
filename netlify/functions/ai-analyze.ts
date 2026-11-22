@@ -14,17 +14,7 @@ interface ModelItem {
   supportedGenerationMethods?: string[];
 }
 
-function buildPayload(prompt: string) {
-  return JSON.stringify({
-    contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    generationConfig: {
-      responseMimeType: 'application/json',
-      temperature: 0.6,
-    },
-  });
-}
-
-async function callGeminiStudio(apiKey: string, model: string, prompt: string) {
+async function callGemini(apiKey: string, model: string, prompt: string) {
   const cleanModel = model.replace(/^models\//, '');
   return fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${cleanModel}:generateContent`,
@@ -34,49 +24,42 @@ async function callGeminiStudio(apiKey: string, model: string, prompt: string) {
         'Content-Type': 'application/json',
         'x-goog-api-key': apiKey,
       },
-      body: buildPayload(prompt),
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig: {
+          responseMimeType: 'application/json',
+          temperature: 0.6,
+        },
+      }),
     }
   );
 }
 
-async function callVertexExpress(apiKey: string, model: string, prompt: string) {
-  const cleanModel = model.replace(/^models\//, '');
-  return fetch(
-    `https://aiplatform.googleapis.com/v1/publishers/google/models/${cleanModel}:generateContent?key=${encodeURIComponent(apiKey)}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: buildPayload(prompt),
-    }
-  );
-}
-
-async function findWorkingFlashModel(apiKey: string): Promise<string | null> {
-  try {
-    const res = await fetch('https://generativelanguage.googleapis.com/v1beta/models', {
-      headers: { 'x-goog-api-key': apiKey },
-    });
-    if (!res.ok) return null;
-    const data = (await res.json()) as { models?: ModelItem[] };
-    const valid = (data.models || []).filter(
-      (m) =>
-        m.name &&
-        m.supportedGenerationMethods?.includes('generateContent') &&
-        m.name.toLowerCase().includes('gemini')
-    );
-    const preferred =
-      valid.find(
-        (m) =>
-          m.name!.includes('flash') &&
-          !m.name!.includes('preview') &&
-          !m.name!.includes('exp')
-      ) ||
-      valid.find((m) => m.name!.includes('flash')) ||
-      valid[0];
-    return preferred?.name?.replace(/^models\//, '') || null;
-  } catch {
-    return null;
+async function detectActiveModel(apiKey: string): Promise<{ model: string | null; listError?: string }> {
+  const res = await fetch('https://generativelanguage.googleapis.com/v1beta/models', {
+    headers: { 'x-goog-api-key': apiKey },
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    return { model: null, listError: `Model list (${res.status}): ${txt.slice(0, 220)}` };
   }
+  const data = (await res.json()) as { models?: ModelItem[] };
+  const skip = ['embedding', 'aqa', 'imagen', 'veo', 'tts', 'audio', 'image', 'robotics', 'computer-use'];
+  const valid = (data.models || []).filter((m) => {
+    const n = (m.name || '').toLowerCase();
+    return (
+      n.includes('gemini') &&
+      m.supportedGenerationMethods?.includes('generateContent') &&
+      !skip.some((word) => n.includes(word))
+    );
+  });
+
+  const preferred =
+    valid.find((m) => m.name!.includes('flash') && !m.name!.includes('lite') && !m.name!.includes('exp')) ||
+    valid.find((m) => m.name!.includes('flash')) ||
+    valid[0];
+
+  return { model: preferred?.name?.replace(/^models\//, '') || null };
 }
 
 export const handler: Handler = async (event) => {
@@ -142,17 +125,15 @@ ${body.transcript.slice(0, 24000)}
 
   try {
     let model = (process.env.GEMINI_MODEL || 'gemini-2.5-flash').trim();
-    let response = apiKey.startsWith('AQ.')
-      ? await callVertexExpress(apiKey, model, prompt)
-      : await callGeminiStudio(apiKey, model, prompt);
+    let response = await callGemini(apiKey, model, prompt);
 
     if (response.status === 404) {
-      const detected = await findWorkingFlashModel(apiKey);
+      const { model: detected, listError } = await detectActiveModel(apiKey);
       if (detected) {
         model = detected;
-        response = await callGeminiStudio(apiKey, model, prompt);
-      } else if (!apiKey.startsWith('AQ.')) {
-        response = await callVertexExpress(apiKey, model, prompt);
+        response = await callGemini(apiKey, model, prompt);
+      } else if (listError) {
+        return json(502, { error: listError });
       }
     }
 
