@@ -9,6 +9,73 @@ interface AnalyzeRequest {
   language: 'bn' | 'en' | 'both';
 }
 
+interface ModelItem {
+  name?: string;
+  supportedGenerationMethods?: string[];
+}
+
+function modelScore(name: string): number {
+  const lower = name.toLowerCase();
+  const verMatch = lower.match(/gemini-(\d+(?:\.\d+)?)/);
+  const ver = verMatch ? parseFloat(verMatch[1]) : 0;
+  let score = ver * 100;
+  if (lower.includes('flash')) score += 20;
+  if (lower.includes('lite')) score -= 5;
+  if (lower.includes('exp') || lower.includes('preview')) score -= 3;
+  return score;
+}
+
+async function callGemini(apiKey: string, model: string, prompt: string) {
+  const cleanModel = model.replace(/^models\//, '');
+  return fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${cleanModel}:generateContent`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': apiKey,
+      },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig: {
+          responseMimeType: 'application/json',
+          temperature: 0.6,
+        },
+      }),
+    }
+  );
+}
+
+async function getCandidateModels(apiKey: string, exclude: string): Promise<{ models: string[]; listError?: string }> {
+  try {
+    const res = await fetch('https://generativelanguage.googleapis.com/v1beta/models', {
+      headers: { 'x-goog-api-key': apiKey },
+    });
+    if (!res.ok) {
+      const txt = await res.text();
+      return { models: [], listError: `ListModels (${res.status}): ${txt.slice(0, 160)}` };
+    }
+    const data = (await res.json()) as { models?: ModelItem[] };
+    const skip = ['embedding', 'aqa', 'imagen', 'veo', 'tts', 'audio', 'image', 'robotics', 'computer-use', 'live'];
+    const names = (data.models || [])
+      .filter((m) => {
+        const n = (m.name || '').toLowerCase();
+        return (
+          n.includes('gemini') &&
+          m.supportedGenerationMethods?.includes('generateContent') &&
+          !skip.some((w) => n.includes(w))
+        );
+      })
+      .map((m) => m.name!.replace(/^models\//, ''))
+      .filter((n) => n !== exclude);
+
+    const unique = Array.from(new Set(names)).sort((a, b) => modelScore(b) - modelScore(a));
+    return { models: unique };
+  } catch (err) {
+    return { models: [], listError: err instanceof Error ? err.message : 'Model lookup failed' };
+  }
+}
+
 export const handler: Handler = async (event) => {
   if (event.httpMethod !== 'POST') return json(405, { error: 'Method not allowed' });
   if (!verifySession(event)) return json(401, { error: 'Unauthorized' });
@@ -32,7 +99,6 @@ export const handler: Handler = async (event) => {
     return json(400, { error: 'Please provide a transcript of at least 20 characters.' });
   }
 
-  const model = (process.env.GEMINI_MODEL || 'gemini-3.8-flash').trim().replace(/^models\//, '');
   const prompt = `
 You are an expert short-form video editor and viral content strategist for YouTube Shorts, Instagram Reels, and Facebook Reels.
 Analyze the following transcript for the video "${body.videoTitle || 'Untitled'}".
@@ -72,33 +138,41 @@ ${body.transcript.slice(0, 24000)}
 `.trim();
 
   try {
-    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': apiKey,
-      },
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        generationConfig: {
-          responseMimeType: 'application/json',
-          temperature: 0.6,
-        },
-      }),
-    });
+    let model = (process.env.GEMINI_MODEL || 'gemini-3.8-flash').trim().replace(/^models\//, '');
+    const tried: string[] = [model];
+    let response = await callGemini(apiKey, model, prompt);
+    let availableModels: string[] = [];
+    let listErr = '';
+
+    if (response.status === 404) {
+      const lookup = await getCandidateModels(apiKey, model);
+      availableModels = lookup.models;
+      listErr = lookup.listError || '';
+
+      for (const candidate of availableModels.slice(0, 6)) {
+        model = candidate;
+        tried.push(candidate);
+        response = await callGemini(apiKey, candidate, prompt);
+        if (response.ok || response.status !== 404) break;
+      }
+    }
 
     if (!response.ok) {
       const errText = await response.text();
-      let reason = errText.slice(0, 260);
+      let reason = errText.slice(0, 220);
       try {
         const parsedErr = JSON.parse(errText) as { error?: { message?: string } };
         if (parsedErr.error?.message) reason = parsedErr.error.message;
       } catch {
-        // keep raw snippet
+        // keep snippet
       }
+      const extra = availableModels.length
+        ? ` | Available: ${availableModels.slice(0, 5).join(', ')}`
+        : listErr
+        ? ` | ${listErr}`
+        : '';
       return json(response.status, {
-        error: `Gemini API (${response.status}, ${model}): ${reason}`,
+        error: `Gemini (${response.status}, tried: ${tried.join(', ')}): ${reason}${extra}`,
       });
     }
 
