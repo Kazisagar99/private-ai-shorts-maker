@@ -22,3 +22,8 @@
     X-Frame-Options = "DENY"
     X-Content-Type-Options = "nosniff"
     Referrer-Policy = "strict-origin-when-cross-origin"
+    
+    [[edge_functions]]
+  path = "/api/ai-analyze"
+  function = "ai-analyze"
+
