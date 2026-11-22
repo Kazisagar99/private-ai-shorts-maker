@@ -9,70 +9,44 @@ interface AnalyzeRequest {
   language: 'bn' | 'en' | 'both';
 }
 
-interface ModelItem {
-  name?: string;
-  supportedGenerationMethods?: string[];
-}
-
-function modelScore(name: string): number {
-  const lower = name.toLowerCase();
-  const verMatch = lower.match(/gemini-(\d+(?:\.\d+)?)/);
-  const ver = verMatch ? parseFloat(verMatch[1]) : 0;
-  let score = ver * 100;
-  if (lower.includes('flash')) score += 20;
-  if (lower.includes('lite')) score -= 5;
-  if (lower.includes('exp') || lower.includes('preview')) score -= 3;
-  return score;
-}
-
-async function callGemini(apiKey: string, model: string, prompt: string) {
+async function callGemini(
+  apiKey: string,
+  model: string,
+  prompt: string,
+  disableThinking: boolean,
+  timeoutMs: number
+) {
   const cleanModel = model.replace(/^models\//, '');
-  return fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${cleanModel}:generateContent`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': apiKey,
-      },
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        generationConfig: {
-          responseMimeType: 'application/json',
-          temperature: 0.6,
-        },
-      }),
-    }
-  );
-}
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-async function getCandidateModels(apiKey: string, exclude: string): Promise<{ models: string[]; listError?: string }> {
+  const generationConfig: Record<string, unknown> = {
+    responseMimeType: 'application/json',
+    temperature: 0.5,
+    maxOutputTokens: 2048,
+  };
+  if (disableThinking) {
+    generationConfig.thinkingConfig = { thinkingBudget: 0 };
+  }
+
   try {
-    const res = await fetch('https://generativelanguage.googleapis.com/v1beta/models', {
-      headers: { 'x-goog-api-key': apiKey },
-    });
-    if (!res.ok) {
-      const txt = await res.text();
-      return { models: [], listError: `ListModels (${res.status}): ${txt.slice(0, 160)}` };
-    }
-    const data = (await res.json()) as { models?: ModelItem[] };
-    const skip = ['embedding', 'aqa', 'imagen', 'veo', 'tts', 'audio', 'image', 'robotics', 'computer-use', 'live'];
-    const names = (data.models || [])
-      .filter((m) => {
-        const n = (m.name || '').toLowerCase();
-        return (
-          n.includes('gemini') &&
-          m.supportedGenerationMethods?.includes('generateContent') &&
-          !skip.some((w) => n.includes(w))
-        );
-      })
-      .map((m) => m.name!.replace(/^models\//, ''))
-      .filter((n) => n !== exclude);
-
-    const unique = Array.from(new Set(names)).sort((a, b) => modelScore(b) - modelScore(a));
-    return { models: unique };
-  } catch (err) {
-    return { models: [], listError: err instanceof Error ? err.message : 'Model lookup failed' };
+    return await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${cleanModel}:generateContent`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': apiKey,
+        },
+        signal: controller.signal,
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+          generationConfig,
+        }),
+      }
+    );
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -99,80 +73,46 @@ export const handler: Handler = async (event) => {
     return json(400, { error: 'Please provide a transcript of at least 20 characters.' });
   }
 
-  const prompt = `
-You are an expert short-form video editor and viral content strategist for YouTube Shorts, Instagram Reels, and Facebook Reels.
-Analyze the following transcript for the video "${body.videoTitle || 'Untitled'}".
-Target clip duration: ~${body.clipDuration || 30} seconds.
-Preferred language mode: ${body.language || 'both'} (Bengali + English).
-Transcript contains real timestamps: ${body.hasTimestamps ? 'YES' : 'NO'}.
+  const model = (process.env.GEMINI_MODEL || 'gemini-3.8-flash')
+    .trim()
+    .replace(/^models\//, '');
 
-STRICT RULES:
-- Return ONLY valid JSON matching the exact schema below. No markdown fences.
-- If "Transcript contains real timestamps" is NO, set "startSec" and "endSec" to null for EVERY clip idea. NEVER invent fake timestamps.
-- If YES, extract accurate numeric seconds (startSec, endSec) directly from the transcript timestamps.
-- Keep Bengali natural, engaging, and modern.
+  const prompt = `Analyze this transcript for "${body.videoTitle || 'Video'}" (~${body.clipDuration || 30}s Shorts, language: ${body.language || 'both'}).
+Timestamps present: ${body.hasTimestamps ? 'YES' : 'NO'}.
+Rules: Return ONLY compact valid JSON. Keep every item short and punchy. If Timestamps=NO, set startSec and endSec to null.
+Exact counts: 2 clipIdeas, 3 viralHooks, 3 titles, 2 descriptions, 5 hashtags, 3 thumbnailTexts, 3 bengaliCaptions, 3 englishCaptions.
+Schema:
+{"clipIdeas":[{"title":"","hook":"","reason":"","startSec":null,"endSec":null,"platformFit":["YouTube Shorts","Instagram Reels"]}],"viralHooks":[""],"titles":[""],"descriptions":[""],"hashtags":["#tag"],"thumbnailTexts":[""],"bengaliCaptions":[""],"englishCaptions":[""]}
 
-JSON SCHEMA:
-{
-  "clipIdeas": [
-    {
-      "title": "string",
-      "hook": "string",
-      "reason": "string (emotional/informative/viral angle)",
-      "startSec": number | null,
-      "endSec": number | null,
-      "platformFit": ["YouTube Shorts", "Instagram Reels", "Facebook Reels"]
-    }
-  ],
-  "viralHooks": ["string"],
-  "titles": ["string"],
-  "descriptions": ["string"],
-  "hashtags": ["#tag1"],
-  "thumbnailTexts": ["string"],
-  "bengaliCaptions": ["string"],
-  "englishCaptions": ["string"]
-}
+Transcript:
+${body.transcript.slice(0, 12000)}`;
 
-TRANSCRIPT:
-${body.transcript.slice(0, 24000)}
-`.trim();
+  const startedAt = Date.now();
 
   try {
-    let model = (process.env.GEMINI_MODEL || 'gemini-3.8-flash').trim().replace(/^models\//, '');
-    const tried: string[] = [model];
-    let response = await callGemini(apiKey, model, prompt);
-    let availableModels: string[] = [];
-    let listErr = '';
+    let response = await callGemini(apiKey, model, prompt, true, 8500);
 
-    if (response.status === 404) {
-      const lookup = await getCandidateModels(apiKey, model);
-      availableModels = lookup.models;
-      listErr = lookup.listError || '';
-
-      for (const candidate of availableModels.slice(0, 6)) {
-        model = candidate;
-        tried.push(candidate);
-        response = await callGemini(apiKey, candidate, prompt);
-        if (response.ok || response.status !== 404) break;
+    if (response.status === 400) {
+      const firstErr = await response.text();
+      if (firstErr.toLowerCase().includes('thinking')) {
+        const remaining = Math.max(3000, 9000 - (Date.now() - startedAt));
+        response = await callGemini(apiKey, model, prompt, false, remaining);
+      } else {
+        return json(400, { error: `Gemini (400, ${model}): ${firstErr.slice(0, 220)}` });
       }
     }
 
     if (!response.ok) {
       const errText = await response.text();
-      let reason = errText.slice(0, 220);
+      let reason = errText.slice(0, 240);
       try {
         const parsedErr = JSON.parse(errText) as { error?: { message?: string } };
         if (parsedErr.error?.message) reason = parsedErr.error.message;
       } catch {
         // keep snippet
       }
-      const extra = availableModels.length
-        ? ` | Available: ${availableModels.slice(0, 5).join(', ')}`
-        : listErr
-        ? ` | ${listErr}`
-        : '';
       return json(response.status, {
-        error: `Gemini (${response.status}, tried: ${tried.join(', ')}): ${reason}${extra}`,
+        error: `Gemini (${response.status}, ${model}): ${reason}`,
       });
     }
 
@@ -186,6 +126,12 @@ ${body.transcript.slice(0, 24000)}
     const parsed = JSON.parse(cleaned);
     return json(200, parsed);
   } catch (err) {
+    const elapsed = Date.now() - startedAt;
+    if (err instanceof Error && err.name === 'AbortError') {
+      return json(504, {
+        error: `Gemini (${model}) took >${Math.round(elapsed / 1000)}s. Retry once or try a shorter transcript.`,
+      });
+    }
     return json(500, {
       error: err instanceof Error ? err.message : 'AI analysis failed.',
     });
